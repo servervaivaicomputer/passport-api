@@ -1,13 +1,6 @@
 """
 Passport Photo Processing API  —  Free-Tier Edition (512 MB)
-=============================================================
-Optimised for Render's free plan:
-  • OpenCV Haar cascades  (bundled, ~2 MB)  replaces MediaPipe (~150 MB)
-  • rembg  u2netp  model   (~20 MB RAM)     replaces u2net (~350 MB)
-  • Aggressive gc + explicit array deletion throughout
-  • Max input dimension capped at 1500 px to limit working-set size
-
-REST-only (no HTML served).  CORS configured for a separate frontend.
+REST-only backend.  CORS for any separate frontend.
 """
 
 from __future__ import annotations
@@ -38,9 +31,8 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
-
 # ═══════════════════════════════════════════════════════════════════════════════
-#  CONFIGURATION  (all tunable via environment variables)
+#  CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
 MAX_UPLOAD_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", "10"))
@@ -51,10 +43,8 @@ ALLOWED_SUFFIXES = frozenset(
     {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif"}
 )
 
-PASSPORT_W: int = 413   # 35 mm @ 300 DPI
-PASSPORT_H: int = 531   # 45 mm @ 300 DPI
-
-# Light-blue background  —  standard for many Asian passport specs
+PASSPORT_W: int = 413
+PASSPORT_H: int = 531
 BG_RGB: tuple = (217, 237, 249)
 
 TTL_SECONDS: int = int(os.getenv("RESULT_EXPIRY_MINUTES", "10")) * 60
@@ -67,7 +57,6 @@ CORS_ORIGINS: List[str] = [
     if o.strip()
 ]
 
-
 # ═══════════════════════════════════════════════════════════════════════════════
 #  LOGGING
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -79,19 +68,16 @@ logging.basicConfig(
 )
 log = logging.getLogger("passport")
 
-
 # ═══════════════════════════════════════════════════════════════════════════════
-#  EPHEMERAL TEMP DIRECTORY  (removed on shutdown + by janitor)
+#  TEMP DIRECTORY
 # ═══════════════════════════════════════════════════════════════════════════════
 
 TMP: Path = Path(tempfile.mkdtemp(prefix="passport_"))
 
-
 # ═══════════════════════════════════════════════════════════════════════════════
-#  LAZY MODEL LOADING  (nothing loaded at import — fast cold-start)
+#  LAZY LOADING  (nothing loaded at import time)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# --- rembg / u2netp (background removal) ---
 _rembg_session = None
 _rembg_lock = threading.Lock()
 
@@ -101,17 +87,13 @@ def _get_rembg():
     if _rembg_session is None:
         with _rembg_lock:
             if _rembg_session is None:
-                log.info("Loading U²-Net Portable model (u2netp — one-time)…")
+                log.info("Loading u2netp model (one-time download)…")
                 t0 = time.monotonic()
                 _rembg_session = new_session("u2netp")
-                log.info(
-                    "u2netp ready (%.1f s).",
-                    time.monotonic() - t0,
-                )
+                log.info("u2netp ready in %.1f s", time.monotonic() - t0)
     return _rembg_session
 
 
-# --- OpenCV Haar cascades (face + eye detection) ---
 _face_cascade = None
 _eye_cascade = None
 _cascade_lock = threading.Lock()
@@ -129,14 +111,14 @@ def _load_cascades():
         _face_cascade = cv2.CascadeClassifier(face_xml)
         _eye_cascade = cv2.CascadeClassifier(eye_xml)
         if _face_cascade.empty():
-            raise RuntimeError(f"Cannot load face cascade: {face_xml}")
+            raise RuntimeError(f"Cannot load: {face_xml}")
         if _eye_cascade.empty():
-            raise RuntimeError(f"Cannot load eye cascade: {eye_xml}")
-        log.info("Haar cascades loaded (face + eye).")
+            raise RuntimeError(f"Cannot load: {eye_xml}")
+        log.info("Haar cascades loaded.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  IN-MEMORY TASK STORE  (no database)
+#  TASK STORE
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class Task:
@@ -147,13 +129,13 @@ class Task:
     )
 
     def __init__(self, tid: str, inp: str):
-        self.id: str = tid
-        self.inp: str = inp
+        self.id = tid
+        self.inp = inp
         self.out: Optional[str] = None
-        self.status: str = "queued"
-        self.progress: int = 0
+        self.status = "queued"
+        self.progress = 0
         self.error: Optional[str] = None
-        self.t_created: float = time.time()
+        self.t_created = time.time()
         self.t_finished: Optional[float] = None
 
     def as_dict(self) -> dict:
@@ -171,20 +153,20 @@ class Task:
 
 _tasks: Dict[str, Task] = {}
 _store_lock = threading.Lock()
-_process_lock = threading.Lock()  # serialises image processing
+_process_lock = threading.Lock()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  UPLOAD VALIDATION
+#  VALIDATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _validate(data: bytes, name: str, ctype: Optional[str] = None) -> None:
+def _validate(data: bytes, name: str, ctype: Optional[str] = None):
     if not data:
         raise ValueError("Empty file")
     if len(data) > MAX_UPLOAD_BYTES:
         raise ValueError(
-            f"File too large ({len(data) / 1_048_576:.1f} MB). "
-            f"Maximum is {MAX_UPLOAD_MB} MB."
+            f"File too large ({len(data)/1_048_576:.1f} MB). "
+            f"Max is {MAX_UPLOAD_MB} MB."
         )
     ext = Path(name).suffix.lower()
     if ext not in ALLOWED_SUFFIXES:
@@ -197,20 +179,14 @@ def _validate(data: bytes, name: str, ctype: Optional[str] = None) -> None:
     try:
         Image.open(io.BytesIO(data)).verify()
     except Exception:
-        raise ValueError("Corrupt or unreadable image file")
+        raise ValueError("Corrupt or unreadable image")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  IMAGE PROCESSING PIPELINE  (every step frees intermediates + calls gc)
+#  PIPELINE
 # ═══════════════════════════════════════════════════════════════════════════════
-
-# --- 1. Face detection (Haar cascade) ----------------------------------------
 
 def _detect_face(gray: np.ndarray):
-    """
-    Returns (x, y, w, h) of the largest detected face, or None.
-    Tries strict parameters first, then relaxed.
-    """
     _load_cascades()
     for params in [
         dict(scaleFactor=1.1, minNeighbors=5, minSize=(80, 80)),
@@ -225,21 +201,13 @@ def _detect_face(gray: np.ndarray):
     return None
 
 
-# --- 2. Eye detection (Haar cascade, upper 60% of face) ----------------------
-
-def _detect_eyes(gray: np.ndarray, fx: int, fy: int, fw: int, fh: int):
-    """
-    Returns ((lx, ly), (rx, ry)) eye centres in full-image coordinates,
-    or None if fewer than two eyes are found.
-    """
+def _detect_eyes(gray, fx, fy, fw, fh):
     _load_cascades()
     roi = gray[fy: fy + int(fh * 0.60), fx: fx + fw]
     if roi.size == 0:
         return None
-
     min_eye = max(12, int(fw * 0.08))
     max_eye = int(fw * 0.40)
-
     for neighbours in (5, 3):
         eyes = _eye_cascade.detectMultiScale(
             roi, scaleFactor=1.05, minNeighbors=neighbours,
@@ -249,21 +217,14 @@ def _detect_eyes(gray: np.ndarray, fx: int, fy: int, fw: int, fh: int):
             break
     else:
         return None
-
-    # Convert to full-image coords, filter out detections near face edges
-    cx_face = fw / 2
     candidates = []
     for ex, ey, ew, eh in eyes:
         ecx = fx + ex + ew // 2
         ecy = fy + ey + eh // 2
-        # keep only detections roughly centred in the face
         if fx + fw * 0.05 < ecx < fx + fw * 0.95:
             candidates.append((ecx, ecy))
-
     if len(candidates) < 2:
         return None
-
-    # Pick the pair with the widest horizontal gap
     best, best_d = None, 0.0
     for i in range(len(candidates)):
         for j in range(i + 1, len(candidates)):
@@ -271,15 +232,12 @@ def _detect_eyes(gray: np.ndarray, fx: int, fy: int, fw: int, fh: int):
             if d > best_d:
                 best_d = d
                 best = (candidates[i], candidates[j])
-
     if best and best_d > fw * 0.15:
         return best
     return None
 
 
-# --- 3. Alignment (rotate so eyes are level) ---------------------------------
-
-def _align(bgr: np.ndarray, eye_pair) -> np.ndarray:
+def _align(bgr, eye_pair):
     if eye_pair is None:
         return bgr
     (lx, ly), (rx, ry) = eye_pair
@@ -290,23 +248,17 @@ def _align(bgr: np.ndarray, eye_pair) -> np.ndarray:
         return bgr
     h, w = bgr.shape[:2]
     M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
-    rotated = cv2.warpAffine(
+    return cv2.warpAffine(
         bgr, M, (w, h),
         flags=cv2.INTER_CUBIC,
         borderMode=cv2.BORDER_REPLICATE,
     )
-    return rotated
 
-
-# --- 4. Background removal (rembg / u2netp) ----------------------------------
 
 def _remove_bg(rgb: np.ndarray) -> np.ndarray:
-    """Returns BGRA array."""
     pil = Image.fromarray(rgb)
     session = _get_rembg()
-
     rgba_pil = None
-    # Try with alpha matting first (better edges)
     try:
         rgba_pil = remove(
             pil, session=session,
@@ -317,11 +269,10 @@ def _remove_bg(rgb: np.ndarray) -> np.ndarray:
             post_process_mask=True,
         )
     except (MemoryError, RuntimeError) as exc:
-        log.warning("Alpha-matting failed (%s); retrying without it.", exc)
+        log.warning("Alpha-matting failed (%s); retrying without.", exc)
         del rgba_pil
         gc.collect()
         rgba_pil = None
-
     if rgba_pil is None:
         try:
             rgba_pil = remove(
@@ -332,45 +283,36 @@ def _remove_bg(rgb: np.ndarray) -> np.ndarray:
         except (MemoryError, RuntimeError):
             gc.collect()
             rgba_pil = remove(pil, session=session)
-
     result = np.array(rgba_pil)
     del rgba_pil
     pil.close()
-
     if result.ndim == 2:
         result = cv2.cvtColor(result, cv2.COLOR_GRAY2BGRA)
     elif result.shape[2] == 3:
         alpha = np.full(result.shape[:2], 255, dtype=np.uint8)
         result = np.dstack([result, alpha])
-
     bgra = cv2.cvtColor(result, cv2.COLOR_RGBA2BGRA)
     del result
     gc.collect()
     return bgra
 
 
-# --- 5. Shadow reduction (CLAHE on L channel, blended) -----------------------
-
-def _soften_shadows(bgra: np.ndarray) -> np.ndarray:
+def _soften_shadows(bgra):
     bgr = bgra[:, :, :3]
     alpha = bgra[:, :, 3]
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
     l_ch, a_ch, b_ch = cv2.split(lab)
     del lab
-
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     l_enhanced = clahe.apply(l_ch)
     l_out = cv2.addWeighted(l_enhanced, 0.55, l_ch, 0.45, 0)
     del l_ch, l_enhanced
-
     bgr_out = cv2.cvtColor(cv2.merge([l_out, a_ch, b_ch]), cv2.COLOR_LAB2BGR)
     del l_out, a_ch, b_ch
     return np.dstack([bgr_out, alpha])
 
 
-# --- 6. White-balance correction (gray-world, foreground only) ---------------
-
-def _white_balance(bgra: np.ndarray) -> np.ndarray:
+def _white_balance(bgra):
     bgr = bgra[:, :, :3].astype(np.float32)
     alpha = bgra[:, :, 3]
     mask = alpha > 128
@@ -381,10 +323,7 @@ def _white_balance(bgra: np.ndarray) -> np.ndarray:
     avgs = [float(c[mask].mean()) for c in channels]
     mid = sum(avgs) / 3.0
     gains = [np.clip(mid / max(v, 1e-6), 0.80, 1.20) for v in avgs]
-    corrected = [
-        np.clip(c * g, 0, 255).astype(np.uint8)
-        for c, g in zip(channels, gains)
-    ]
+    corrected = [np.clip(c * g, 0, 255).astype(np.uint8) for c, g in zip(channels, gains)]
     del channels
     merged = cv2.merge(corrected)
     del corrected
@@ -393,41 +332,27 @@ def _white_balance(bgra: np.ndarray) -> np.ndarray:
     return result
 
 
-# --- 7. Passport-spec crop (face-centred, ICAO proportions) ------------------
-
-def _passport_crop(bgra: np.ndarray, face) -> np.ndarray:
+def _passport_crop(bgra, face):
     h, w = bgra.shape[:2]
     fx, fy, fw, fh = int(face[0]), int(face[1]), int(face[2]), int(face[3])
-
     if fh < 80:
-        raise ValueError(
-            "Face is too small in the photo. "
-            "Please upload a closer photo with a clearly visible face."
-        )
-
+        raise ValueError("Face too small. Upload a closer photo.")
     face_cx = fx + fw // 2
-    # Estimate eye-line at ~40 % from top of face bounding box
     eye_y = fy + int(fh * 0.40)
-
     aspect = PASSPORT_W / PASSPORT_H
     crop_h = int(fh / 0.55)
     crop_w = int(crop_h * aspect)
-
     crop_top = int(eye_y - crop_h * 0.40)
     crop_left = int(face_cx - crop_w / 2)
     crop_bot = crop_top + crop_h
     crop_right = crop_left + crop_w
-
-    # Padding if crop extends beyond image bounds
     pad_t = max(0, -crop_top)
     pad_l = max(0, -crop_left)
     pad_b = max(0, crop_bot - h)
     pad_r = max(0, crop_right - w)
-
     y1, x1 = max(0, crop_top), max(0, crop_left)
     y2, x2 = min(h, crop_bot), min(w, crop_right)
     cropped = bgra[y1:y2, x1:x2].copy()
-
     if pad_t or pad_l or pad_b or pad_r:
         cropped = cv2.copyMakeBorder(
             cropped, pad_t, pad_b, pad_l, pad_r,
@@ -436,59 +361,49 @@ def _passport_crop(bgra: np.ndarray, face) -> np.ndarray:
     return cropped
 
 
-# --- 8. Composite onto blue background + resize ------------------------------
-
-def _composite(bgra: np.ndarray) -> np.ndarray:
+def _composite(bgra):
     h, w = bgra.shape[:2]
-    bg = np.full((h, w, 3), BG_RGB[::-1], dtype=np.uint8)  # RGB→BGR
+    bg = np.full((h, w, 3), BG_RGB[::-1], dtype=np.uint8)
     alpha = bgra[:, :, 3:4].astype(np.float32) / 255.0
     fg = bgra[:, :, :3].astype(np.float32)
     blended = (fg * alpha + bg * (1.0 - alpha)).astype(np.uint8)
     del bg, alpha, fg, bgra
-    result = cv2.resize(
-        blended, (PASSPORT_W, PASSPORT_H), interpolation=cv2.INTER_LANCZOS4,
-    )
+    result = cv2.resize(blended, (PASSPORT_W, PASSPORT_H), interpolation=cv2.INTER_LANCZOS4)
     del blended
     gc.collect()
     return result
 
 
-# --- Pipeline orchestrator ---------------------------------------------------
+# ── Pipeline orchestrator ────────────────────────────────────────────────────
 
-def _run_pipeline(task: Task) -> None:
+def _run_pipeline(task: Task):
     try:
         task.status = "processing"
         task.progress = 5
 
-        # ── 1. Load image ────────────────────────────────────────────────
+        # 1. Load
         bgr = cv2.imread(task.inp, cv2.IMREAD_COLOR)
         if bgr is None:
             raise ValueError("Could not decode image file.")
         h, w = bgr.shape[:2]
         if min(h, w) < MIN_DIMENSION:
-            raise ValueError(
-                f"Image too small ({w}×{h}). "
-                f"Minimum {MIN_DIMENSION}px on the shortest side."
-            )
+            raise ValueError(f"Image too small ({w}x{h}). Min {MIN_DIMENSION}px.")
         if max(h, w) > MAX_DIMENSION:
             scale = MAX_DIMENSION / max(h, w)
-            bgr = cv2.resize(
-                bgr, (int(w * scale), int(h * scale)),
-                interpolation=cv2.INTER_AREA,
-            )
+            bgr = cv2.resize(bgr, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
         task.progress = 10
 
-        # ── 2. Detect face ───────────────────────────────────────────────
+        # 2. Detect face
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         face = _detect_face(gray)
         if face is None:
             raise ValueError(
-                "No face detected. Please upload a clear, front-facing photo "
+                "No face detected. Upload a clear front-facing photo "
                 "with the full face visible and eyes open."
             )
         task.progress = 20
 
-        # ── 3. Detect eyes + align ───────────────────────────────────────
+        # 3. Eyes + align
         fx, fy, fw, fh = [int(v) for v in face]
         eyes = _detect_eyes(gray, fx, fy, fw, fh)
         del gray
@@ -497,7 +412,7 @@ def _run_pipeline(task: Task) -> None:
         gc.collect()
         task.progress = 28
 
-        # ── 4. Re-detect face on aligned image ───────────────────────────
+        # 4. Re-detect face on aligned image
         gray2 = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         face2 = _detect_face(gray2)
         del gray2
@@ -505,8 +420,8 @@ def _run_pipeline(task: Task) -> None:
             face2 = face
         task.progress = 32
 
-        # ── 5. Background removal ────────────────────────────────────────
-        log.info("[%s] Removing background (u2netp)…", task.id[:8])
+        # 5. Background removal
+        log.info("[%s] Removing background…", task.id[:8])
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         del bgr
         fg = _remove_bg(rgb)
@@ -514,29 +429,29 @@ def _run_pipeline(task: Task) -> None:
         gc.collect()
         task.progress = 58
 
-        # ── 6. Shadow reduction ──────────────────────────────────────────
+        # 6. Shadows
         fg = _soften_shadows(fg)
         gc.collect()
         task.progress = 68
 
-        # ── 7. White-balance correction ──────────────────────────────────
+        # 7. White balance
         fg = _white_balance(fg)
         gc.collect()
         task.progress = 76
 
-        # ── 8. Passport-spec crop ────────────────────────────────────────
+        # 8. Crop
         fg = _passport_crop(fg, face2)
         del face2
         gc.collect()
         task.progress = 86
 
-        # ── 9. Composite + resize ────────────────────────────────────────
+        # 9. Composite
         final = _composite(fg)
         del fg
         gc.collect()
         task.progress = 93
 
-        # ── 10. Save high-quality JPEG ───────────────────────────────────
+        # 10. Save
         out_path = TMP / f"{task.id}.jpg"
         Image.fromarray(cv2.cvtColor(final, cv2.COLOR_BGR2RGB)).save(
             str(out_path), "JPEG", quality=95, subsampling=0,
@@ -548,10 +463,7 @@ def _run_pipeline(task: Task) -> None:
         task.progress = 100
         task.status = "completed"
         task.t_finished = time.time()
-        log.info(
-            "[%s] Done in %.1fs",
-            task.id[:8], task.t_finished - task.t_created,
-        )
+        log.info("[%s] Done in %.1fs", task.id[:8], task.t_finished - task.t_created)
 
     except ValueError as exc:
         task.status = "failed"
@@ -564,23 +476,22 @@ def _run_pipeline(task: Task) -> None:
         task.status = "failed"
         task.error = "Internal processing error."
         task.t_finished = time.time()
-        log.exception("[%s] Unexpected error: %s", task.id[:8], exc)
+        log.exception("[%s] Unexpected: %s", task.id[:8], exc)
         gc.collect()
 
 
-def _guarded_pipeline(task: Task) -> None:
-    """Acquire the serial-processing lock, then run."""
+def _guarded_pipeline(task: Task):
     with _process_lock:
         _run_pipeline(task)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  CLEANUP JANITOR  (sweeps expired temp files every 60 s)
+#  JANITOR
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _sweep_expired() -> None:
+def _sweep_expired():
     now = time.time()
-    dead: list = []
+    dead = []
     with _store_lock:
         for tid, t in _tasks.items():
             if t.t_finished and (now - t.t_finished) > TTL_SECONDS:
@@ -598,20 +509,17 @@ def _sweep_expired() -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  FASTAPI APPLICATION
+#  FASTAPI APP
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info(
-        "Passport Photo API starting  |  temp=%s  |  max_dim=%d",
-        TMP, MAX_DIMENSION,
-    )
+    log.info("Starting  |  temp=%s  |  max_dim=%d", TMP, MAX_DIMENSION)
     janitor = asyncio.create_task(_janitor_loop())
     yield
     janitor.cancel()
     shutil.rmtree(TMP, ignore_errors=True)
-    log.info("Stopped — temp directory removed.")
+    log.info("Stopped — temp removed.")
 
 
 async def _janitor_loop():
@@ -620,21 +528,14 @@ async def _janitor_loop():
         try:
             _sweep_expired()
         except Exception:
-            log.exception("Janitor sweep failed.")
+            log.exception("Janitor failed.")
 
 
 app = FastAPI(
     title="Passport Photo API",
-    description=(
-        "Automated passport-photo processing: face detection, "
-        "background removal (U²-Net Portable), shadow reduction, "
-        "white-balance correction, and ICAO-spec cropping."
-    ),
     version="1.0.0-free",
     lifespan=lifespan,
 )
-
-# ── CORS ─────────────────────────────────────────────────────────────────────
 
 app.add_middleware(
     CORSMiddleware,
@@ -645,8 +546,6 @@ app.add_middleware(
     expose_headers=["Content-Disposition"],
 )
 
-# ── Rate limiting ────────────────────────────────────────────────────────────
-
 _limiter = Limiter(
     key_func=get_remote_address,
     default_limits=["60/minute"],
@@ -656,7 +555,7 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  REST ENDPOINTS  — no HTML, no static files, pure API
+#  ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/api/health")
@@ -668,19 +567,13 @@ async def health():
         "photo_requirements": {
             "formats": sorted(ALLOWED_SUFFIXES),
             "max_size": f"{MAX_UPLOAD_MB} MB",
-            "min_dimension": f"{MIN_DIMENSION}px shortest side",
-            "max_dimension": f"{MAX_DIMENSION}px longest side",
-            "face": "Clearly visible, front-facing, eyes open",
+            "min_dimension": f"{MIN_DIMENSION}px",
+            "max_dimension": f"{MAX_DIMENSION}px",
         },
         "output": {
             "size": f"{PASSPORT_W}x{PASSPORT_H}px (35x45mm @ 300 DPI)",
-            "background": f"RGB{BG_RGB} light blue",
-            "format": "JPEG quality 95, 4:4:4 chroma",
-        },
-        "config": {
-            "result_ttl_minutes": TTL_SECONDS // 60,
-            "processing": "one image at a time",
-            "model": "u2netp (lightweight)",
+            "background": f"RGB{BG_RGB}",
+            "format": "JPEG quality 95",
         },
     }
 
@@ -688,7 +581,6 @@ async def health():
 @app.post("/api/upload")
 @_limiter.limit("10/minute")
 async def upload(request: Request, file: UploadFile = File(...)):
-    """Upload a photo. Returns a task_id for polling and download."""
     raw = await file.read()
     _validate(raw, file.filename or "unknown.jpg", file.content_type)
 
@@ -701,18 +593,16 @@ async def upload(request: Request, file: UploadFile = File(...)):
     with _store_lock:
         _tasks[tid] = task
 
-    threading.Thread(
-        target=_guarded_pipeline, args=(task,), daemon=True,
-    ).start()
+    threading.Thread(target=_guarded_pipeline, args=(task,), daemon=True).start()
 
-    log.info("[%s] Queued  %s  (%.0f KB)", tid[:8], ext, len(raw) / 1024)
+    log.info("[%s] Queued %s (%.0f KB)", tid[:8], ext, len(raw) / 1024)
 
     return JSONResponse(
         status_code=202,
         content={
             "task_id": tid,
             "status": "queued",
-            "message": "Upload accepted. Processing has started.",
+            "message": "Upload accepted. Processing started.",
             "status_url": f"/api/status/{tid}",
             "result_url": f"/api/result/{tid}",
         },
@@ -722,7 +612,6 @@ async def upload(request: Request, file: UploadFile = File(...)):
 @app.get("/api/status/{task_id}")
 @_limiter.limit("120/minute")
 async def get_status(request: Request, task_id: str):
-    """Poll progress (0-100%)."""
     with _store_lock:
         task = _tasks.get(task_id)
     if not task:
@@ -733,23 +622,16 @@ async def get_status(request: Request, task_id: str):
 @app.get("/api/result/{task_id}")
 @_limiter.limit("30/minute")
 async def get_result(request: Request, task_id: str):
-    """Download the finished passport photo as JPEG."""
     with _store_lock:
         task = _tasks.get(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found or expired.")
     if task.status == "failed":
-        raise HTTPException(
-            status_code=422, detail=f"Processing failed: {task.error}",
-        )
+        raise HTTPException(status_code=422, detail=f"Processing failed: {task.error}")
     if task.status != "completed":
-        raise HTTPException(
-            status_code=202,
-            detail="Still processing. Poll /api/status/{task_id}.",
-        )
+        raise HTTPException(status_code=202, detail="Still processing.")
     if not task.out or not os.path.exists(task.out):
-        raise HTTPException(status_code=410, detail="Result file has expired.")
-
+        raise HTTPException(status_code=410, detail="Result expired.")
     return FileResponse(
         path=task.out,
         media_type="image/jpeg",
@@ -761,7 +643,6 @@ async def get_result(request: Request, task_id: str):
 @app.delete("/api/task/{task_id}")
 @_limiter.limit("30/minute")
 async def delete_task(request: Request, task_id: str):
-    """Manually delete a task and its temporary files."""
     with _store_lock:
         task = _tasks.pop(task_id, None)
     if not task:
@@ -774,10 +655,6 @@ async def delete_task(request: Request, task_id: str):
                 pass
     return {"detail": "Deleted", "task_id": task_id}
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  ENTRY POINT
-# ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     import uvicorn
